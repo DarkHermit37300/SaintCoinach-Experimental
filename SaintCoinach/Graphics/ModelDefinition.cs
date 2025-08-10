@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -37,7 +37,6 @@ namespace SaintCoinach.Graphics {
         public Unknowns.ModelStruct6[] UnknownStructs6 { get; private set; }
         public Unknowns.ModelStruct7[] UnknownStructs7 { get; private set; }
         public Unknowns.BoneIndices BoneIndices { get; private set; }
-        // Here's padding, but not keeping a variable amount of 0s
         public ModelBoundingBoxes BoundingBoxes { get; private set; }
         public Bone[] Bones { get; private set; }
         #endregion
@@ -45,7 +44,6 @@ namespace SaintCoinach.Graphics {
         #region Constructor
         public ModelDefinition(ModelFile file) {
             File = file;
-
             Build();
         }
         #endregion
@@ -54,6 +52,9 @@ namespace SaintCoinach.Graphics {
         public Model GetModel(int quality) { return GetModel((ModelQuality)quality); }
         public Model GetModel(ModelQuality quality) {
             var v = (int)quality;
+            if (v < 0 || v >= _Models.Length)
+                throw new ArgumentOutOfRangeException(nameof(quality), $"Quality {quality} is out of range");
+            
             if (_Models[v] == null)
                 _Models[v] = new Model(this, quality);
             return _Models[v];
@@ -64,83 +65,229 @@ namespace SaintCoinach.Graphics {
         private void Build() {
             const int DefinitionPart = 1;
 
-            // osg and bil_*_base.mdl workaround
-            // These models contain an extra 120 bytes after model headers
-            bool isOsg = File.Path.Contains("/osg_");
+            try {
+                var buffer = File.GetPart(DefinitionPart);
+                
+                // Find where the strings section begins
+                var stringsInfo = FindStringsSection(buffer);
+                var stringsOffset = stringsInfo.StringsOffset;
+                var stringsSize = stringsInfo.StringsSize;
+                var headerOffset = stringsOffset + stringsSize;
 
-            var buffer = File.GetPart(DefinitionPart);
-            var stringsSize = BitConverter.ToInt32(buffer, StringsSizeOffset);
+                // osg and bil_*_base.mdl workaround
+                bool isOsg = File.Path.Contains("/osg_");
 
-            var offset = StringsOffset + stringsSize;    // Skipping those, they'll be read further along the road
+                var offset = headerOffset;
+                
+                // Validate we have enough space for the header
+                if (offset + System.Runtime.InteropServices.Marshal.SizeOf<ModelDefinitionHeader>() > buffer.Length) {
+                    throw new InvalidOperationException($"Buffer too small for header at offset {offset:X}");
+                }
 
-            this.Header = buffer.ToStructure<ModelDefinitionHeader>(ref offset);
-            this.UnknownStructs1 = buffer.ToStructures<Unknowns.ModelStruct1>(Header.UnknownStruct1Count, ref offset);
-            this.ModelHeaders = buffer.ToStructures<ModelHeader>(ModelCount, ref offset);
+                this.Header = buffer.ToStructure<ModelDefinitionHeader>(ref offset);
+                
+                // Add debug output to see what we're reading
+                System.Diagnostics.Debug.WriteLine($"Header read from offset {headerOffset:X}:");
+                System.Diagnostics.Debug.WriteLine($"  MeshCount: {Header.MeshCount}");
+                System.Diagnostics.Debug.WriteLine($"  AttributeCount: {Header.AttributeCount}");
+                System.Diagnostics.Debug.WriteLine($"  PartCount: {Header.PartCount}");
+                System.Diagnostics.Debug.WriteLine($"  MaterialCount: {Header.MaterialCount}");
+                System.Diagnostics.Debug.WriteLine($"  BoneCount: {Header.BoneCount}");
+                
+                ValidateHeaderCounts();
 
-            // Skip 120 bytes after model headers
-            if (isOsg)
-                offset += 120;
+                this.UnknownStructs1 = SafeToStructures<Unknowns.ModelStruct1>(buffer, Header.UnknownStruct1Count, ref offset);
+                this.ModelHeaders = SafeToStructures<ModelHeader>(buffer, ModelCount, ref offset);
 
-            var availableQualities = new List<ModelQuality>();
-            for (var i = 0; i < this.ModelHeaders.Length; ++i) {
-                if (this.ModelHeaders[i].MeshCount > 0)
-                    availableQualities.Add((ModelQuality)i);
+                // Skip 120 bytes after model headers for OSG models
+                if (isOsg && offset + 120 <= buffer.Length) {
+                    offset += 120;
+                }
+
+                var availableQualities = new List<ModelQuality>();
+                for (var i = 0; i < Math.Min(this.ModelHeaders.Length, 3); ++i) {
+                    if (this.ModelHeaders[i].MeshCount > 0)
+                        availableQualities.Add((ModelQuality)i);
+                }
+                this.AvailableQualities = availableQualities;
+
+                this.MeshHeaders = SafeToStructures<MeshHeader>(buffer, Header.MeshCount, ref offset);
+
+                this.AttributeNames = ReadStrings(buffer, Header.AttributeCount, ref offset, stringsOffset);
+                if (Header.AttributeCount > 0) {
+                    this.Attributes = new ModelAttribute[Header.AttributeCount];
+                    for (var i = 0; i < Header.AttributeCount; ++i)
+                        this.Attributes[i] = new ModelAttribute(this, i);
+                }
+
+                this.UnknownStructs2 = SafeToStructures<Unknowns.ModelStruct2>(buffer, Header.UnknownStruct2Count, ref offset);
+                this.MeshPartHeaders = SafeToStructures<MeshPartHeader>(buffer, Header.PartCount, ref offset);
+                this.UnknownStructs3 = SafeToStructures<Unknowns.ModelStruct3>(buffer, Header.UnknownStruct3Count, ref offset);
+
+                this.MaterialNames = ReadStrings(buffer, Header.MaterialCount, ref offset, stringsOffset);
+                if (Header.MaterialCount > 0) {
+                    this.Materials = new MaterialDefinition[Header.MaterialCount];
+                    for (var i = 0; i < Header.MaterialCount; ++i)
+                        this.Materials[i] = new MaterialDefinition(this, i);
+                }
+
+                this.BoneNames = ReadStrings(buffer, Header.BoneCount, ref offset, stringsOffset);
+                this.BoneLists = SafeToStructures<Unknowns.BoneList>(buffer, Header.UnknownStruct4Count, ref offset);
+                this.UnknownStructs5 = SafeToStructures<Unknowns.ModelStruct5>(buffer, Header.UnknownStruct5Count, ref offset);
+                this.UnknownStructs6 = SafeToStructures<Unknowns.ModelStruct6>(buffer, Header.UnknownStruct6Count, ref offset);
+                this.UnknownStructs7 = SafeToStructures<Unknowns.ModelStruct7>(buffer, Header.UnknownStruct7Count, ref offset);
+
+                if (offset < buffer.Length) {
+                    this.BoneIndices = new Unknowns.BoneIndices(buffer, ref offset);
+                }
+
+                // Handle padding
+                if (offset < buffer.Length && buffer[offset] <= 32) {
+                    var paddingSize = buffer[offset];
+                    if (offset + paddingSize + 1 <= buffer.Length) {
+                        offset += paddingSize + 1;
+                    }
+                }
+
+                if (offset + System.Runtime.InteropServices.Marshal.SizeOf<ModelBoundingBoxes>() <= buffer.Length) {
+                    this.BoundingBoxes = buffer.ToStructure<ModelBoundingBoxes>(ref offset);
+                }
+
+                if (Header.BoneCount > 0) {
+                    this.Bones = new Bone[Header.BoneCount];
+                    for (var i = 0; i < Header.BoneCount; ++i) {
+                        if (offset < buffer.Length) {
+                            this.Bones[i] = new Bone(this, i, buffer, ref offset);
+                        }
+                    }
+                }
+
+                BuildVertexFormats();
+                
+            } catch (Exception ex) {
+                throw new InvalidOperationException($"Failed to parse model definition for {File.Path}: {ex.Message}", ex);
             }
-            this.AvailableQualities = availableQualities;
-
-            this.MeshHeaders = buffer.ToStructures<MeshHeader>(Header.MeshCount, ref offset);
-
-            this.AttributeNames = ReadStrings(buffer, Header.AttributeCount, ref offset);
-            this.Attributes = new ModelAttribute[Header.AttributeCount];
-            for (var i = 0; i < Header.AttributeCount; ++i)
-                this.Attributes[i] = new ModelAttribute(this, i);
-
-            this.UnknownStructs2 = buffer.ToStructures<Unknowns.ModelStruct2>(Header.UnknownStruct2Count, ref offset);
-            this.MeshPartHeaders = buffer.ToStructures<MeshPartHeader>(Header.PartCount, ref offset);
-            this.UnknownStructs3 = buffer.ToStructures<Unknowns.ModelStruct3>(Header.UnknownStruct3Count, ref offset);
-
-            this.MaterialNames = ReadStrings(buffer, Header.MaterialCount, ref offset);
-            this.Materials = new MaterialDefinition[Header.MaterialCount];
-            for (var i = 0; i < Header.MaterialCount; ++i)
-                this.Materials[i] = new MaterialDefinition(this, i);
-
-
-            this.BoneNames = ReadStrings(buffer, Header.BoneCount, ref offset);
-            this.BoneLists = buffer.ToStructures<Unknowns.BoneList>(Header.UnknownStruct4Count, ref offset);
-            this.UnknownStructs5 = buffer.ToStructures<Unknowns.ModelStruct5>(Header.UnknownStruct5Count, ref offset);
-            this.UnknownStructs6 = buffer.ToStructures<Unknowns.ModelStruct6>(Header.UnknownStruct6Count, ref offset);
-            this.UnknownStructs7 = buffer.ToStructures<Unknowns.ModelStruct7>(Header.UnknownStruct7Count, ref offset);
-            this.BoneIndices = new Unknowns.BoneIndices(buffer, ref offset);
-
-            offset += buffer[offset] + 1;   // Just padding, first byte specifying how many 0-bytes follow.
-
-            this.BoundingBoxes = buffer.ToStructure<ModelBoundingBoxes>(ref offset);
-
-            this.Bones = new Bone[Header.BoneCount];
-            for (var i = 0; i < Header.BoneCount; ++i)
-                this.Bones[i] = new Bone(this, i, buffer, ref offset);
-
-            if (offset != buffer.Length) {
-                //System.Diagnostics.Debugger.Break();    // Something's not right here.
-            }
-
-            BuildVertexFormats();
         }
+
+        private struct StringsInfo {
+            public int StringsOffset;
+            public int StringsSize;
+            public int StringsCount;
+        }
+
+        private StringsInfo FindStringsSection(byte[] buffer) {
+            // Search for the strings section by looking for the pattern:
+            // [strings_count] [strings_size] [string_data...]
+            
+            for (int i = 0; i < buffer.Length - 8; i += 4) {
+                var potentialCount = BitConverter.ToInt32(buffer, i);
+                var potentialSize = BitConverter.ToInt32(buffer, i + 4);
+                
+                // Reasonable bounds for strings count and size
+                if (potentialCount > 0 && potentialCount < 1000 && 
+                    potentialSize > 0 && potentialSize < buffer.Length &&
+                    i + 8 + potentialSize <= buffer.Length) {
+                    
+                    // Check if this looks like actual string data
+                    if (LooksLikeStrings(buffer, i + 8, potentialSize)) {
+                        return new StringsInfo {
+                            StringsOffset = i + 8,
+                            StringsSize = potentialSize,
+                            StringsCount = potentialCount
+                        };
+                    }
+                }
+            }
+            
+            throw new InvalidOperationException("Could not find strings section in model file");
+        }
+
+        private bool LooksLikeStrings(byte[] buffer, int offset, int size) {
+            if (offset + size > buffer.Length) return false;
+            
+            int nullTerminators = 0;
+            int printableChars = 0;
+            int totalChars = 0;
+            
+            for (int i = offset; i < offset + Math.Min(size, 200); i++) {
+                totalChars++;
+                if (buffer[i] == 0) {
+                    nullTerminators++;
+                } else if (buffer[i] >= 32 && buffer[i] < 127) {
+                    printableChars++;
+                }
+            }
+            
+            // Should have a good ratio of printable characters and some null terminators
+            return nullTerminators >= 3 && 
+                   printableChars > totalChars * 0.6 && 
+                   (printableChars + nullTerminators) > totalChars * 0.8;
+        }
+
+        private T[] SafeToStructures<T>(byte[] buffer, int count, ref int offset) where T : struct {
+            if (count <= 0 || count > 10000) return new T[0];
+            
+            var structSize = System.Runtime.InteropServices.Marshal.SizeOf<T>();
+            if (offset + (structSize * count) > buffer.Length) {
+                throw new InvalidOperationException($"Buffer too small for {count} structures of type {typeof(T).Name} at offset {offset:X}");
+            }
+            
+            return buffer.ToStructures<T>(count, ref offset);
+        }
+
+        private void ValidateHeaderCounts() {
+            const int MAX_COUNT = 10000;
+            
+            if (Header.MeshCount < 0 || Header.MeshCount > MAX_COUNT)
+                throw new InvalidOperationException($"Invalid MeshCount: {Header.MeshCount}");
+            if (Header.AttributeCount < 0 || Header.AttributeCount > MAX_COUNT)
+                throw new InvalidOperationException($"Invalid AttributeCount: {Header.AttributeCount}");
+            if (Header.PartCount < 0 || Header.PartCount > MAX_COUNT)
+                throw new InvalidOperationException($"Invalid PartCount: {Header.PartCount}");
+            if (Header.MaterialCount < 0 || Header.MaterialCount > MAX_COUNT)
+                throw new InvalidOperationException($"Invalid MaterialCount: {Header.MaterialCount}");
+            if (Header.BoneCount < 0 || Header.BoneCount > MAX_COUNT)
+                throw new InvalidOperationException($"Invalid BoneCount: {Header.BoneCount}");
+        }
+
         private void BuildVertexFormats() {
             const int FormatPart = 0;
 
-            var buffer = File.GetPart(FormatPart);
+            try {
+                var buffer = File.GetPart(FormatPart);
 
-            this.VertexFormats = new VertexFormat[Header.MeshCount];
-            var offset = 0;
-            for (var i = 0; i < Header.MeshCount; ++i)
-                this.VertexFormats[i] = new VertexFormat(buffer, ref offset);
+                if (Header.MeshCount > 0) {
+                    this.VertexFormats = new VertexFormat[Header.MeshCount];
+                    var offset = 0;
+                    for (var i = 0; i < Header.MeshCount; ++i) {
+                        if (offset < buffer.Length) {
+                            this.VertexFormats[i] = new VertexFormat(buffer, ref offset);
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                throw new InvalidOperationException($"Failed to build vertex formats: {ex.Message}", ex);
+            }
         }
-        private static string[] ReadStrings(byte[] buffer, int count, ref int offset) {
+
+        private static string[] ReadStrings(byte[] buffer, int count, ref int offset, int stringsBaseOffset) {
+            if (count <= 0) return new string[0];
+            
             var values = new string[count];
             for (var i = 0; i < count; ++i) {
+                if (offset + 4 > buffer.Length) {
+                    // Not enough data for string offset
+                    Array.Resize(ref values, i);
+                    break;
+                }
+                
                 var stringOffset = BitConverter.ToInt32(buffer, offset);
-                values[i] = buffer.ReadString(StringsOffset + stringOffset);
+                
+                if (stringOffset < 0 || stringsBaseOffset + stringOffset >= buffer.Length) {
+                    values[i] = string.Empty;
+                } else {
+                    values[i] = buffer.ReadString(stringsBaseOffset + stringOffset);
+                }
                 offset += 4;
             }
             return values;
